@@ -11,6 +11,7 @@ Cambios clave en esta versión:
 - Refactor: separación entre funciones "core" (independientes de Streamlit) y la UI.
 - FastAPI app con endpoints `/detect` y `/identify` (proxy mínimo).
 - Correcciones de keys de widgets para evitar duplicados.
+- Compatibilidad para rerun entre distintas versiones de Streamlit mediante _maybe_rerun().
 
 Uso:
 - Ejecutar la UI: `streamlit run streamlit_azure_face_gui.py`
@@ -23,10 +24,10 @@ Dependencias:
 Notas legales: el uso de biometría tiene implicaciones legales. Usa con consentimiento.
 """
 
-import os, time, json, base64, requests, sqlite3
+import os, time, json, base64, requests, sqlite3, zipfile
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from io import BytesIO
+from io import BytesIO, TextIOWrapper
 import pandas as pd
 
 DB_FILE = os.path.join(os.getcwd(), 'face_gui.sqlite')
@@ -272,14 +273,27 @@ def api_identify(req: IdentifyRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ---------------- STREAMLIT COMPATIBILITY ----------------
+def _maybe_rerun():
+    """Compatibility helper for Streamlit rerun across versions.
+    Tries st.experimental_rerun (older), then st.rerun (newer).
+    Raises RuntimeError if neither exists to make the failure explicit.
+    """
+    try:
+        import streamlit as _st
+    except Exception:
+        raise RuntimeError('streamlit no disponible en el entorno al llamar a _maybe_rerun()')
+    if hasattr(_st, 'experimental_rerun'):
+        return _st.experimental_rerun()
+    if hasattr(_st, 'rerun'):
+        return _st.rerun()
+    raise RuntimeError(f"Tu versión de Streamlit ({getattr(_st, '__version__', 'desconocida')}) no soporta rerun programático.")
+
 # ---------------- STREAMLIT UI ----------------
 def run_streamlit():
     import streamlit as st
     from PIL import Image, ImageDraw, ImageFont
 
-    # ... (el resto de la UI se mantiene igual a tu última versión con pestañas Config, Detect, Attributes, Verify, Identify, FindSimilar, Collections, Batch, Liveness, Logs)
-    # 👆 Puedes pegar sin cambios lo que ya tenías en tu último código.
-    # Solo corregí duplicados de keys y algún detalle de persistencia.
     st.write("Streamlit GUI para Azure Face API lista. Ejecuta con: `streamlit run streamlit_azure_face_gui.py`")
 
     # safe secret helper
@@ -375,10 +389,10 @@ def run_streamlit():
                         cfg_loaded = load_config_from_db(sel)
                         if cfg_loaded:
                             st.session_state.cfg.update(cfg_loaded)
-                            st.experimental_rerun()
+                            _maybe_rerun()
                     if st.button('Eliminar config seleccionada', key='cfg_del_db'):
                         delete_config_from_db(sel)
-                        st.experimental_rerun()
+                        _maybe_rerun()
 
         with col2:
             st.subheader('Import / Export')
@@ -574,7 +588,7 @@ def run_streamlit():
             faces = try_core(detect_faces_core, b, return_landmarks=False, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
             if faces:
                 faceIds = [f['faceId'] for f in faces]
-                res = try_core(identify_core, faceIds, selected_group, maxCandidates := max_candidates, confidenceThreshold := conf_thr)
+                res = try_core(identify_core, faceIds, selected_group, maxNumOfCandidatesReturned=max_candidates, confidenceThreshold=conf_thr)
                 if res:
                     st.json(res)
                     persons = try_core(list_persons_in_group_core, selected_group) or []
@@ -685,7 +699,7 @@ def run_streamlit():
                         try:
                             delete_persisted_face_core(st.session_state.cfg, detail_group, sel_person, pf)
                             st.success('Persisted face borrado (actualiza listado)')
-                            st.experimental_rerun()
+                            _maybe_rerun()
                         except Exception as e:
                             st.error(str(e))
 
