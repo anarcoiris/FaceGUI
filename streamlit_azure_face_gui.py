@@ -12,6 +12,8 @@ Cambios clave en esta versión:
 - FastAPI app con endpoints `/detect` y `/identify` (proxy mínimo).
 - Correcciones de keys de widgets para evitar duplicados.
 - Compatibilidad para rerun entre distintas versiones de Streamlit mediante _maybe_rerun().
+- Manejo explícito de errores 403 UnsupportedFeature con mensaje instructivo.
+- Por defecto la UI no solicita faceId (para evitar 403 en recursos no aprobados); hay un flag en Config para habilitar las features de identificación si tu recurso está aprobado.
 
 Uso:
 - Ejecutar la UI: `streamlit run streamlit_azure_face_gui.py`
@@ -113,7 +115,8 @@ def api_url_from_cfg(cfg, path):
     endpoint = cfg.get('endpoint') or os.environ.get('FACE_ENDPOINT')
     if not endpoint:
         raise ValueError('Endpoint no configurado (cfg.endpoint o env FACE_ENDPOINT)')
-    return f"{endpoint.rstrip('/')}{API_PREFIX}{path}"
+    return f"{endpoint.rstrip('/')}" + API_PREFIX + path
+
 
 def do_request_core(cfg, method, path, params=None, headers=None, data=None, json_payload=None, stream=False):
     session = make_requests_session(cfg)
@@ -121,6 +124,27 @@ def do_request_core(cfg, method, path, params=None, headers=None, data=None, jso
     hdrs = {**(headers or {}), **get_auth_headers_from_cfg(cfg)}
     resp = session.request(method, url, params=params, headers=hdrs, data=data, 
                            json=json_payload, timeout=cfg.get('timeout',10), stream=stream)
+    # Manejo específico para 403 UnsupportedFeature (mensaje más útil)
+    if resp.status_code == 403:
+        try:
+            body = resp.json()
+            # intenta extraer inner error
+            inner = None
+            if isinstance(body, dict):
+                inner = body.get('error', {}) or body
+                code = inner.get('code') if isinstance(inner, dict) else None
+                msg = inner.get('message') if isinstance(inner, dict) else str(inner)
+                if code and 'UnsupportedFeature' in str(code):
+                    hint = ("Azure Face API: UnsupportedFeature. Las capacidades de identificación/verification/person-groups pueden estar vetadas en tu recurso. "
+                            "Si necesitas esas features, solicita acceso en: aka.ms/facerecognition. "
+                            "Si solo necesitas detección/atributos, configura la app para no solicitar faceId (Config -> deshabilitar identificación).")
+                    raise RuntimeError(f"403 UnsupportedFeature: {msg} — {hint}")
+                else:
+                    raise RuntimeError(f"403 Forbidden: {body}")
+            else:
+                resp.raise_for_status()
+        except ValueError:
+            resp.raise_for_status()
     resp.raise_for_status()
     try:
         return resp.json()
@@ -317,7 +341,9 @@ def run_streamlit():
             'retries': 3,
             'backoff_factor': 0.3,
             'recognition_model': DEFAULT_RECOGNITION_MODEL,
-            'detection_model': DEFAULT_DETECTION_MODEL
+            'detection_model': DEFAULT_DETECTION_MODEL,
+            # flag: habilitar features de identificación (solo si aprobado)
+            'enable_identification_features': False
         }
     if 'log' not in st.session_state:
         st.session_state.log = []
@@ -369,6 +395,9 @@ def run_streamlit():
             st.markdown('**Modelos**')
             st.session_state.cfg['recognition_model'] = st.selectbox('Recognition model', ["recognition_04","recognition_03","recognition_02","recognition_01"], index=0, key='cfg_recog_model')
             st.session_state.cfg['detection_model'] = st.selectbox('Detection model', ["detection_03","detection_02","detection_01"], index=0, key='cfg_det_model')
+
+            # enable identification features flag
+            st.session_state.cfg['enable_identification_features'] = st.checkbox('Habilitar IDENTIFICACIÓN/VERIFICACIÓN/persongroups (solo si Microsoft te aprobó)', value=st.session_state.cfg.get('enable_identification_features', False), key='cfg_enable_id')
 
             if st.button('Guardar configuración en sesión', key='cfg_save_btn'):
                 st.success('Configuración guardada en sesión (no persistente).')
@@ -443,9 +472,15 @@ def run_streamlit():
         detect_landmarks = st.checkbox('Devolver landmarks', value=False, key='detect_landmarks')
         recognition_model = st.selectbox('Recognition model (detect)', ["recognition_04","recognition_03","recognition_02","recognition_01"], index=0, key='detect_recog')
         detection_model = st.selectbox('Detection model (detect)', ["detection_03","detection_02","detection_01"], index=0, key='detect_det')
+        # decide whether to request faceId based on config flag
+        allow_face_id = st.session_state.cfg.get('enable_identification_features', False)
+        if allow_face_id:
+            st.info('Has habilitado IDENTIFICACIÓN: la API intentará devolver faceId (solo si tu recurso está aprobado).')
+        else:
+            st.caption('Por defecto no se solicita faceId para evitar 403 UnsupportedFeature. Activa IDENTIFICACIÓN en Config si tu recurso ha sido aprobado.')
         if uploaded:
             img_bytes = uploaded.read()
-            faces = try_core(detect_faces_core, img_bytes, return_landmarks=detect_landmarks, recognition_model=recognition_model, detection_model=detection_model)
+            faces = try_core(detect_faces_core, img_bytes, return_landmarks=detect_landmarks, return_face_id=allow_face_id, recognition_model=recognition_model, detection_model=detection_model)
             if faces is not None:
                 # draw boxes
                 image = Image.open(BytesIO(img_bytes)).convert('RGB')
@@ -486,7 +521,7 @@ def run_streamlit():
             img = uploaded_attr.read()
             # build attributes param
             attrs_param = ','.join(selected_attrs) if selected_attrs else None
-            faces = try_core(detect_faces_core, img, return_landmarks=True, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'), return_face_attributes=attrs_param)
+            faces = try_core(detect_faces_core, img, return_landmarks=True, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'), return_face_attributes=attrs_param)
             if not faces:
                 st.warning('No se detectaron caras')
             else:
@@ -564,13 +599,16 @@ def run_streamlit():
         img2 = col_b.file_uploader('Imagen B', key='v_img2', type=['jpg','jpeg','png'])
         if img1 and img2:
             b1 = img1.read(); b2 = img2.read()
-            f1 = try_core(detect_faces_core, b1, return_landmarks=False, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
-            f2 = try_core(detect_faces_core, b2, return_landmarks=False, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
+            f1 = try_core(detect_faces_core, b1, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
+            f2 = try_core(detect_faces_core, b2, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
             if f1 and f2 and len(f1)>0 and len(f2)>0:
-                res = try_core(verify_faces_core, f1[0]['faceId'], f2[0]['faceId'])
-                if res:
-                    st.write('¿Mismo sujeto? ->', res.get('isIdentical'))
-                    st.write('Confianza ->', res.get('confidence'))
+                if not f1[0].get('faceId') or not f2[0].get('faceId'):
+                    st.error('No se devolvió faceId en la detección. Activa IDENTIFICACIÓN en Config si tu recurso está aprobado por Microsoft.')
+                else:
+                    res = try_core(verify_faces_core, f1[0]['faceId'], f2[0]['faceId'])
+                    if res:
+                        st.write('¿Mismo sujeto? ->', res.get('isIdentical'))
+                        st.write('Confianza ->', res.get('confidence'))
             else:
                 st.warning('No se detectó cara en una de las imágenes')
 
@@ -585,22 +623,26 @@ def run_streamlit():
         conf_thr = st.slider('Confidence threshold', 0.0, 1.0, 0.5, key='identify_conf')
         if id_img and selected_group:
             b = id_img.read()
-            faces = try_core(detect_faces_core, b, return_landmarks=False, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
+            faces = try_core(detect_faces_core, b, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
             if faces:
-                faceIds = [f['faceId'] for f in faces]
-                res = try_core(identify_core, faceIds, selected_group, maxNumOfCandidatesReturned=max_candidates, confidenceThreshold=conf_thr)
-                if res:
-                    st.json(res)
-                    persons = try_core(list_persons_in_group_core, selected_group) or []
-                    persons_map = {p['personId']: p for p in persons}
-                    out = []
-                    for r in res:
-                        fid = r.get('faceId')
-                        for c in r.get('candidates', []):
-                            pid = c.get('personId')
-                            out.append({'faceId': fid, 'personId': pid, 'personName': persons_map.get(pid, {}).get('name'), 'confidence': c.get('confidence')})
-                    if out:
-                        st.table(pd.DataFrame(out))
+                # ensure faceIds exist
+                faceIds = [f.get('faceId') for f in faces if f.get('faceId')]
+                if not faceIds:
+                    st.error('No se devolvieron faceId. Activa IDENTIFICACIÓN en Config si tu recurso está aprobado.')
+                else:
+                    res = try_core(identify_core, faceIds, selected_group, maxNumOfCandidatesReturned=max_candidates, confidenceThreshold=conf_thr)
+                    if res:
+                        st.json(res)
+                        persons = try_core(list_persons_in_group_core, selected_group) or []
+                        persons_map = {p['personId']: p for p in persons}
+                        out = []
+                        for r in res:
+                            fid = r.get('faceId')
+                            for c in r.get('candidates', []):
+                                pid = c.get('personId')
+                                out.append({'faceId': fid, 'personId': pid, 'personName': persons_map.get(pid, {}).get('name'), 'confidence': c.get('confidence')})
+                        if out:
+                            st.table(pd.DataFrame(out))
 
     # ---------- FindSimilar Tab ----------
     with tabs[5]:
@@ -610,12 +652,15 @@ def run_streamlit():
         maxcand = st.slider('Max candidatos', 1, 10, 5, key='fs_maxc')
         if f_img:
             b = f_img.read()
-            faces = try_core(detect_faces_core, b, return_landmarks=False, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
+            faces = try_core(detect_faces_core, b, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
             if faces:
-                faceId = faces[0]['faceId']
-                res = try_core(find_similar_core, faceId, largeFaceListId=(large_face_list or None), maxNumOfCandidatesReturned=maxcand)
-                if res:
-                    st.json(res)
+                fid = faces[0].get('faceId')
+                if not fid:
+                    st.error('No se devolvió faceId. Activa IDENTIFICACIÓN en Config si tu recurso está aprobado.')
+                else:
+                    res = try_core(find_similar_core, fid, largeFaceListId=(large_face_list or None), maxNumOfCandidatesReturned=maxcand)
+                    if res:
+                        st.json(res)
 
     # ---------- Collections Tab (incluye A: persona detalle) ----------
     with tabs[6]:
@@ -750,9 +795,9 @@ def run_streamlit():
     # ---------- Liveness Tab ----------
     with tabs[8]:
         st.header('Liveness (sesiones)')
-        st.markdown('''Esta sección crea una sesión de liveness (server side) y permite consultar resultados. La parte de cliente (subir vídeo/selfie desde dispositivo para la sesión) debe integrarse en tu frontend usando el token/URL de la sesión.
+        st.markdown("""Esta sección crea una sesión de liveness (server side) y permite consultar resultados. La parte de cliente (subir vídeo/selfie desde dispositivo para la sesión) debe integrarse en tu frontend usando el token/URL de la sesión.
 
-    **Importante**: el servicio Liveness puede requerir acceso por separado y está sujeto a políticas de uso de Face. ''')
+    **Importante**: el servicio Liveness puede requerir acceso por separado y está sujeto a políticas de uso de Face. """)
         l_mode = st.selectbox('Modo', ['active','passive'], key='liveness_mode')
         verify_img = st.file_uploader('Opcional: imagen para verificar durante la sesión (verify image)', key='liveness_verify')
         if st.button('Crear sesión de liveness', key='liveness_create'):
