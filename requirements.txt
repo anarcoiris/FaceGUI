@@ -1,0 +1,11 @@
+streamlit
+requests
+pillow
+pandas
+python-dotenv
+fastapi
+uvicorn[standard]
+azure-identity
+azure-storage-blob
+azure-storage-file-datalake
+python-multipart

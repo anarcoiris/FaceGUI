@@ -1,0 +1,1 @@
+https://faceapi-bigdata.cognitiveservices.azure.com/
