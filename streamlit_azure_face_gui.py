@@ -6,31 +6,35 @@ Archivo: streamlit_azure_face_gui.py
 Resumen: App en Streamlit que cubre Detect, Verify, Identify, FindSimilar,
 Gestión de colecciones (LargePersonGroup / Persons / persistedFaces), Liveness y utilidades.
 
-Cambios clave en esta versión:
-- Añadida pestaña "Attributes" que permite seleccionar y visualizar todas las características faciales que Face API puede devolver (edad, género, emociones, hair color, accesorios, maquillaje, occlusion, blur, exposure, noise, etc.).
-- Refactor: separación entre funciones "core" (independientes de Streamlit) y la UI.
-- FastAPI app con endpoints `/detect` y `/identify` (proxy mínimo).
-- Correcciones de keys de widgets para evitar duplicados.
-- Compatibilidad para rerun entre distintas versiones de Streamlit mediante _maybe_rerun().
-- Manejo explícito de errores 403 UnsupportedFeature con mensaje instructivo.
-- Por defecto la UI no solicita faceId (para evitar 403 en recursos no aprobados); hay un flag en Config para habilitar las features de identificación si tu recurso está aprobado.
-
-Uso:
-- Ejecutar la UI: `streamlit run streamlit_azure_face_gui.py`
-- Ejecutar la API: `uvicorn streamlit_azure_face_gui:app --port 8000`
-
-Dependencias:
-- pip install streamlit requests pillow pandas python-dotenv fastapi uvicorn python-multipart
-- Si usas Azure AD: pip install azure-identity
-
-Notas legales: el uso de biometría tiene implicaciones legales. Usa con consentimiento.
+Cambios clave:
+ - Manejo explícito de 403 UnsupportedFeature.
+ - Integración opcional con Azure Blob Storage y ADLS Gen2.
+ - FastAPI proxy mínimo (/detect y /identify).
+ - Flag en UI para habilitar identification features (por defecto desactivado).
 """
 
-import os, time, json, base64, requests, sqlite3, zipfile
+import os
+import time
+import json
+import base64
+import requests
+import sqlite3
+import zipfile
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from io import BytesIO, TextIOWrapper
 import pandas as pd
+
+# Optional Azure libraries will be imported lazily / guarded
+try:
+    from azure.storage.blob import BlobServiceClient
+except Exception:
+    BlobServiceClient = None
+
+try:
+    from azure.storage.filedatalake import DataLakeServiceClient
+except Exception:
+    DataLakeServiceClient = None
 
 DB_FILE = os.path.join(os.getcwd(), 'face_gui.sqlite')
 API_PREFIX = "/face/v1.0"
@@ -54,7 +58,7 @@ init_db()
 def save_config_to_db(name, cfg, db_file=DB_FILE):
     conn = sqlite3.connect(db_file)
     cur = conn.cursor()
-    cur.execute('REPLACE INTO configs (name, cfg_json, created_at) VALUES (?, ?, ?)', 
+    cur.execute('REPLACE INTO configs (name, cfg_json, created_at) VALUES (?, ?, ?)',
                 (name, json.dumps(cfg), time.strftime('%Y-%m-%d %H:%M:%S')))
     conn.commit()
     conn.close()
@@ -90,13 +94,14 @@ def make_requests_session(cfg=None):
     if retries and retries > 0:
         retry = Retry(total=retries, backoff_factor=backoff,
                       status_forcelist=[429, 500, 502, 503, 504],
-                      allowed_methods=["GET","POST","PUT","DELETE","HEAD","OPTIONS"])
+                      allowed_methods=["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS"])
         adapter = HTTPAdapter(max_retries=retry)
         session.mount('https://', adapter)
         session.mount('http://', adapter)
     return session
 
 def get_auth_headers_from_cfg(cfg):
+    """Return headers for Face API calls."""
     if cfg.get('auth_method') == 'Azure AD':
         try:
             from azure.identity import DefaultAzureCredential
@@ -115,34 +120,28 @@ def api_url_from_cfg(cfg, path):
     endpoint = cfg.get('endpoint') or os.environ.get('FACE_ENDPOINT')
     if not endpoint:
         raise ValueError('Endpoint no configurado (cfg.endpoint o env FACE_ENDPOINT)')
-    return f"{endpoint.rstrip('/')}" + API_PREFIX + path
-
+    return f"{endpoint.rstrip('/')}{API_PREFIX}{path}"
 
 def do_request_core(cfg, method, path, params=None, headers=None, data=None, json_payload=None, stream=False):
     session = make_requests_session(cfg)
     url = api_url_from_cfg(cfg, path)
     hdrs = {**(headers or {}), **get_auth_headers_from_cfg(cfg)}
-    resp = session.request(method, url, params=params, headers=hdrs, data=data, 
-                           json=json_payload, timeout=cfg.get('timeout',10), stream=stream)
+    resp = session.request(method, url, params=params, headers=hdrs, data=data,
+                           json=json_payload, timeout=cfg.get('timeout', 10), stream=stream)
     # Manejo específico para 403 UnsupportedFeature (mensaje más útil)
     if resp.status_code == 403:
         try:
             body = resp.json()
-            # intenta extraer inner error
-            inner = None
-            if isinstance(body, dict):
-                inner = body.get('error', {}) or body
-                code = inner.get('code') if isinstance(inner, dict) else None
-                msg = inner.get('message') if isinstance(inner, dict) else str(inner)
-                if code and 'UnsupportedFeature' in str(code):
-                    hint = ("Azure Face API: UnsupportedFeature. Las capacidades de identificación/verification/person-groups pueden estar vetadas en tu recurso. "
-                            "Si necesitas esas features, solicita acceso en: aka.ms/facerecognition. "
-                            "Si solo necesitas detección/atributos, configura la app para no solicitar faceId (Config -> deshabilitar identificación).")
-                    raise RuntimeError(f"403 UnsupportedFeature: {msg} — {hint}")
-                else:
-                    raise RuntimeError(f"403 Forbidden: {body}")
+            inner = body.get('error', {}) if isinstance(body, dict) else body
+            code = inner.get('code') if isinstance(inner, dict) else None
+            msg = inner.get('message') if isinstance(inner, dict) else str(inner)
+            if code and 'UnsupportedFeature' in str(code):
+                hint = ("Azure Face API: UnsupportedFeature. Las capacidades de identificación/verification/person-groups pueden estar vetadas en tu recurso. "
+                        "Si necesitas esas features, solicita acceso en: aka.ms/facerecognition. "
+                        "Si solo necesitas detección/atributos, configura la app para no solicitar faceId (Config -> deshabilitar identificación).")
+                raise RuntimeError(f"403 UnsupportedFeature: {msg} — {hint}")
             else:
-                resp.raise_for_status()
+                raise RuntimeError(f"403 Forbidden: {json.dumps(body)}")
         except ValueError:
             resp.raise_for_status()
     resp.raise_for_status()
@@ -152,8 +151,8 @@ def do_request_core(cfg, method, path, params=None, headers=None, data=None, jso
         return resp.text
 
 # ---------------- FACE API CORE ----------------
-def detect_faces_core(cfg, img_bytes, return_landmarks=True, return_face_id=True, 
-                      detection_model=DEFAULT_DETECTION_MODEL, recognition_model=DEFAULT_RECOGNITION_MODEL, 
+def detect_faces_core(cfg, img_bytes, return_landmarks=True, return_face_id=True,
+                      detection_model=DEFAULT_DETECTION_MODEL, recognition_model=DEFAULT_RECOGNITION_MODEL,
                       return_face_attributes=None):
     params = {
         'returnFaceId': str(return_face_id).lower(),
@@ -163,18 +162,18 @@ def detect_faces_core(cfg, img_bytes, return_landmarks=True, return_face_id=True
     }
     if return_face_attributes:
         params['returnFaceAttributes'] = return_face_attributes
-    return do_request_core(cfg, 'POST', '/detect', params=params, 
+    return do_request_core(cfg, 'POST', '/detect', params=params,
                            headers={'Content-Type': 'application/octet-stream'}, data=img_bytes)
 
 def verify_faces_core(cfg, faceId1, faceId2):
-    return do_request_core(cfg, 'POST', '/verify', 
-                           headers={'Content-Type': 'application/json'}, 
+    return do_request_core(cfg, 'POST', '/verify',
+                           headers={'Content-Type': 'application/json'},
                            json_payload={'faceId1': faceId1, 'faceId2': faceId2})
 
 def identify_core(cfg, faceIds, largePersonGroupId, maxNumOfCandidatesReturned=5, confidenceThreshold=0.5):
-    return do_request_core(cfg, 'POST', '/identify', 
-                           headers={'Content-Type': 'application/json'}, 
-                           json_payload={'faceIds': faceIds,'largePersonGroupId': largePersonGroupId,
+    return do_request_core(cfg, 'POST', '/identify',
+                           headers={'Content-Type': 'application/json'},
+                           json_payload={'faceIds': faceIds, 'largePersonGroupId': largePersonGroupId,
                                          'maxNumOfCandidatesReturned': maxNumOfCandidatesReturned,
                                          'confidenceThreshold': confidenceThreshold})
 
@@ -182,14 +181,14 @@ def find_similar_core(cfg, faceId, largeFaceListId=None, faceIds=None, maxNumOfC
     payload = {'faceId': faceId, 'maxNumOfCandidatesReturned': maxNumOfCandidatesReturned, 'mode': mode}
     if largeFaceListId: payload['largeFaceListId'] = largeFaceListId
     if faceIds: payload['faceIds'] = faceIds
-    return do_request_core(cfg, 'POST', '/findsimilars', 
-                           headers={'Content-Type': 'application/json'}, 
+    return do_request_core(cfg, 'POST', '/findsimilars',
+                           headers={'Content-Type': 'application/json'},
                            json_payload=payload)
 
-# --- LargePersonGroup (abreviado, pero completo en tu versión anterior) ---
+# LargePersonGroup helpers
 def create_large_person_group_core(cfg, group_id, name, recognition_model=DEFAULT_RECOGNITION_MODEL):
-    return do_request_core(cfg, 'PUT', f'/largepersongroups/{group_id}', 
-                           headers={'Content-Type': 'application/json'}, 
+    return do_request_core(cfg, 'PUT', f'/largepersongroups/{group_id}',
+                           headers={'Content-Type': 'application/json'},
                            json_payload={'name': name, 'recognitionModel': recognition_model})
 
 def list_large_person_groups_core(cfg):
@@ -198,11 +197,11 @@ def list_large_person_groups_core(cfg):
 def create_person_core(cfg, group_id, person_name, user_data=None):
     payload = {'name': person_name}
     if user_data: payload['userData'] = user_data
-    return do_request_core(cfg, 'POST', f'/largepersongroups/{group_id}/persons', 
+    return do_request_core(cfg, 'POST', f'/largepersongroups/{group_id}/persons',
                            headers={'Content-Type': 'application/json'}, json_payload=payload)
 
 def add_face_to_person_core(cfg, group_id, person_id, img_bytes):
-    return do_request_core(cfg, 'POST', f'/largepersongroups/{group_id}/persons/{person_id}/persistedFaces', 
+    return do_request_core(cfg, 'POST', f'/largepersongroups/{group_id}/persons/{person_id}/persistedFaces',
                            headers={'Content-Type': 'application/octet-stream'}, data=img_bytes)
 
 def train_large_person_group_core(cfg, group_id):
@@ -220,7 +219,7 @@ def get_person_core(cfg, group_id, person_id):
 def delete_persisted_face_core(cfg, group_id, person_id, persistedFaceId):
     session = make_requests_session(cfg)
     url = api_url_from_cfg(cfg, f'/largepersongroups/{group_id}/persons/{person_id}/persistedFaces/{persistedFaceId}')
-    resp = session.delete(url, headers=get_auth_headers_from_cfg(cfg), timeout=cfg.get('timeout',10))
+    resp = session.delete(url, headers=get_auth_headers_from_cfg(cfg), timeout=cfg.get('timeout', 10))
     resp.raise_for_status()
     return True
 
@@ -229,50 +228,25 @@ def create_liveness_session_core(cfg, mode='active', verify_image_bytes=None):
     payload = {'mode': mode}
     if verify_image_bytes:
         payload['verifyImage'] = {'data': base64.b64encode(verify_image_bytes).decode('utf-8')}
-    return do_request_core(cfg, 'POST', '/detectLiveness-sessions', 
+    return do_request_core(cfg, 'POST', '/detectLiveness-sessions',
                            headers={'Content-Type': 'application/json'}, json_payload=payload)
 
 def get_liveness_session_core(cfg, session_id):
     return do_request_core(cfg, 'GET', f'/detectLiveness-sessions/{session_id}')
 
 # ---------------- AZURE STORAGE (Blob + ADLS Gen2) ----------------
-# Helper functions to upload/download/list in Blob Storage and ADLS Gen2.
-try:
-    from azure.storage.blob import BlobServiceClient
-    from azure.storage.filedatalake import DataLakeServiceClient
-    from azure.identity import DefaultAzureCredential
-except Exception:
-    # If packages are missing, the functions will raise at runtime with a clear message.
-    BlobServiceClient = None
-    DataLakeServiceClient = None
-    DefaultAzureCredential = None
-
-
 def _get_azure_credential(cfg):
-    """Return a credential for Azure services. If config/auth_method requests Azure AD,
-    try DefaultAzureCredential; otherwise return None (use connection string or account key).
-    """
-    if (cfg.get('auth_method') == 'Azure AD') or cfg.get('storage_auth_method') == 'Azure AD':
+    """Return DefaultAzureCredential() if requested via config, otherwise None."""
+    if cfg.get('auth_method') == 'Azure AD' or cfg.get('storage_auth_method') == 'Azure AD':
         try:
             from azure.identity import DefaultAzureCredential as _DAC
             return _DAC()
         except Exception:
             raise RuntimeError('Instala azure-identity: pip install azure-identity')
-    return None (use connection string or account key).
-    """
-    if (cfg.get('auth_method') == 'Azure AD') or cfg.get('storage_auth_method') == 'Azure AD':
-        try:
-            from azure.identity import DefaultAzureCredential as _DAC
-n            return _DAC()
-        except Exception as e:
-            raise RuntimeError('Instala azure-identity: pip install azure-identity')
     return None
 
-
 def get_blob_service_client(cfg):
-    """Build a BlobServiceClient based on cfg keys (blob_connection_string, blob_account_url, blob_account_key).
-    Prioritizes connection string, then account_url + AzureAD, then account_url + account_key.
-    """
+    """Build a BlobServiceClient based on cfg keys (blob_connection_string, blob_account_url, blob_account_key)."""
     if BlobServiceClient is None:
         raise RuntimeError('Instala azure-storage-blob: pip install azure-storage-blob')
     conn = cfg.get('blob_connection_string') or os.environ.get('AZURE_STORAGE_CONNECTION_STRING')
@@ -288,7 +262,6 @@ def get_blob_service_client(cfg):
             return BlobServiceClient(account_url=account_url, credential=account_key)
     raise ValueError('No se pudo construir BlobServiceClient: configura blob_connection_string o blob_account_url y credenciales.')
 
-
 def upload_blob(cfg, container, blob_name, data_bytes, overwrite=True):
     client = get_blob_service_client(cfg)
     container_client = client.get_container_client(container)
@@ -300,19 +273,16 @@ def upload_blob(cfg, container, blob_name, data_bytes, overwrite=True):
     blob_client.upload_blob(data_bytes, overwrite=overwrite)
     return True
 
-
 def download_blob(cfg, container, blob_name):
     client = get_blob_service_client(cfg)
     blob_client = client.get_blob_client(container=container, blob=blob_name)
     stream = blob_client.download_blob()
     return stream.readall()
 
-
 def list_blobs(cfg, container, prefix=None):
     client = get_blob_service_client(cfg)
     container_client = client.get_container_client(container)
     return [{'name': b.name, 'size': getattr(b, 'size', None)} for b in container_client.list_blobs(name_starts_with=prefix)]
-
 
 def get_datalake_service_client(cfg):
     if DataLakeServiceClient is None:
@@ -330,7 +300,6 @@ def get_datalake_service_client(cfg):
             return DataLakeServiceClient(account_url=account_url, credential=account_key)
     raise ValueError('No se pudo construir DataLakeServiceClient: configura datalake_account_url o CONNECTION_STRING')
 
-
 def upload_file_to_adls(cfg, filesystem, path, data_bytes, overwrite=True):
     client = get_datalake_service_client(cfg)
     fs_client = client.get_file_system_client(filesystem)
@@ -339,12 +308,16 @@ def upload_file_to_adls(cfg, filesystem, path, data_bytes, overwrite=True):
     except Exception:
         pass
     file_client = fs_client.get_file_client(path)
-    # create/append/flush pattern
-    file_client.create_file()
+    # Overwrite if exists
+    try:
+        file_client.create_file()
+    except Exception:
+        # if already exists, we will proceed to overwrite via append/flush pattern
+        pass
+    # append & flush (safe for relatively small files)
     file_client.append_data(data_bytes, offset=0, length=len(data_bytes))
     file_client.flush_data(len(data_bytes))
     return True
-
 
 def download_file_from_adls(cfg, filesystem, path):
     client = get_datalake_service_client(cfg)
@@ -352,7 +325,6 @@ def download_file_from_adls(cfg, filesystem, path):
     file_client = fs_client.get_file_client(path)
     stream = file_client.download_file()
     return stream.readall()
-
 
 def list_paths_adls(cfg, filesystem, path=None, recursive=False):
     client = get_datalake_service_client(cfg)
@@ -362,7 +334,6 @@ def list_paths_adls(cfg, filesystem, path=None, recursive=False):
     for p in paths:
         out.append({'name': p.name, 'is_directory': p.is_directory, 'content_length': getattr(p, 'content_length', None)})
     return out
-
 
 # ---------------- FASTAPI PROXY ----------------
 from fastapi import FastAPI, HTTPException
@@ -397,7 +368,7 @@ def build_cfg_from_creds(creds: Optional[Creds]):
         'endpoint': creds.endpoint if creds and creds.endpoint else os.environ.get('FACE_ENDPOINT'),
         'key': creds.key if creds and creds.key else os.environ.get('FACE_KEY'),
         'auth_method': creds.auth_method if creds and creds.auth_method else 'Subscription Key',
-        'timeout': 10,'retries': 2,'backoff_factor': 0.3
+        'timeout': 10, 'retries': 2, 'backoff_factor': 0.3
     }
 
 @app.post('/detect')
@@ -419,8 +390,8 @@ def api_detect(req: DetectRequest):
 def api_identify(req: IdentifyRequest):
     cfg = build_cfg_from_creds(req.creds)
     try:
-        res = identify_core(cfg, req.faceIds, req.largePersonGroupId, 
-                            maxNumOfCandidatesReturned=req.maxNumOfCandidatesReturned, 
+        res = identify_core(cfg, req.faceIds, req.largePersonGroupId,
+                            maxNumOfCandidatesReturned=req.maxNumOfCandidatesReturned,
                             confidenceThreshold=req.confidenceThreshold)
         return {'result': res}
     except Exception as e:
@@ -428,10 +399,7 @@ def api_identify(req: IdentifyRequest):
 
 # ---------------- STREAMLIT COMPATIBILITY ----------------
 def _maybe_rerun():
-    """Compatibility helper for Streamlit rerun across versions.
-    Tries st.experimental_rerun (older), then st.rerun (newer).
-    Raises RuntimeError if neither exists to make the failure explicit.
-    """
+    """Compatibility helper for Streamlit rerun across versions."""
     try:
         import streamlit as _st
     except Exception:
@@ -449,7 +417,6 @@ def run_streamlit():
 
     st.write("Streamlit GUI para Azure Face API lista. Ejecuta con: `streamlit run streamlit_azure_face_gui.py`")
 
-    # safe secret helper
     def safe_get_secret_streamlit(key, default=''):
         try:
             return st.secrets.get(key, default)
@@ -472,7 +439,12 @@ def run_streamlit():
             'recognition_model': DEFAULT_RECOGNITION_MODEL,
             'detection_model': DEFAULT_DETECTION_MODEL,
             # flag: habilitar features de identificación (solo si aprobado)
-            'enable_identification_features': False
+            'enable_identification_features': False,
+            # optional storage settings
+            'blob_connection_string': os.environ.get('AZURE_STORAGE_CONNECTION_STRING', ''),
+            'blob_account_url': os.environ.get('BLOB_ACCOUNT_URL', ''),
+            'blob_account_key': os.environ.get('AZURE_STORAGE_ACCOUNT_KEY', ''),
+            'datalake_account_url': os.environ.get('DATALAKE_ACCOUNT_URL', '')
         }
     if 'log' not in st.session_state:
         st.session_state.log = []
@@ -480,7 +452,6 @@ def run_streamlit():
     def log(msg, level='info'):
         st.session_state.log.insert(0, f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {level.upper()}: {msg}")
 
-    # small wrapper to call core do_request and capture errors
     def try_core(fn, *args, **kwargs):
         try:
             return fn(st.session_state.cfg, *args, **kwargs)
@@ -492,24 +463,29 @@ def run_streamlit():
     st.set_page_config(page_title='Azure Face API GUI (Attributes)', layout='wide')
     st.title('Azure Face API — Streamlit GUI (Attributes)')
 
-    tabs = st.tabs(["Config", "Detect", "Attributes", "Verify", "Identify", "FindSimilar", "Collections", "Batch", "Liveness", "Storage", "Logs"])  
+    tabs = st.tabs(["Config", "Detect", "Attributes", "Verify", "Identify", "FindSimilar", "Collections", "Batch", "Liveness", "Storage", "Logs"])
 
     # ---------- Config Tab ----------
     with tabs[0]:
         st.header('Configuración')
-        col1, col2 = st.columns([2,1])
+        col1, col2 = st.columns([2, 1])
         with col1:
             st.subheader('Credenciales y endpoint')
-            auth_method = st.selectbox('Método de autenticación', ['Subscription Key', 'Azure AD'], index=0 if st.session_state.cfg.get('auth_method','Subscription Key')=='Subscription Key' else 1, key='cfg_auth_method')
+            auth_method = st.selectbox('Método de autenticación', ['Subscription Key', 'Azure AD'],
+                                       index=0 if st.session_state.cfg.get('auth_method', 'Subscription Key') == 'Subscription Key' else 1,
+                                       key='cfg_auth_method')
             st.session_state.cfg['auth_method'] = auth_method
 
-            endpoint = st.text_input('Endpoint (ej. https://<mi-recurso>.cognitiveservices.azure.com)', value=st.session_state.cfg.get('endpoint',''), key='cfg_endpoint')
+            endpoint = st.text_input('Endpoint (ej. https://<mi-recurso>.cognitiveservices.azure.com)',
+                                     value=st.session_state.cfg.get('endpoint', ''), key='cfg_endpoint')
             if auth_method == 'Subscription Key':
-                key = st.text_input('Subscription Key (Ocp-Apim-Subscription-Key)', value=st.session_state.cfg.get('key',''), type='password', key='cfg_key')
+                key = st.text_input('Subscription Key (Ocp-Apim-Subscription-Key)',
+                                    value=st.session_state.cfg.get('key', ''), type='password', key='cfg_key')
                 st.session_state.cfg['key'] = key.strip()
                 st.session_state.cfg['use_managed_identity'] = False
             else:
-                use_mi = st.checkbox('Usar Managed Identity / DefaultAzureCredential', value=st.session_state.cfg.get('use_managed_identity', False), key='cfg_use_mi')
+                use_mi = st.checkbox('Usar Managed Identity / DefaultAzureCredential',
+                                     value=st.session_state.cfg.get('use_managed_identity', False), key='cfg_use_mi')
                 st.session_state.cfg['use_managed_identity'] = use_mi
                 st.write('La app intentará usar DefaultAzureCredential. En local añade variables de entorno AZURE_* o usa autenticación interactiva.')
 
@@ -517,16 +493,17 @@ def run_streamlit():
 
             st.markdown('**Parámetros de cliente (retries/timeout)**')
             col_a, col_b, col_c = st.columns(3)
-            st.session_state.cfg['timeout'] = col_a.number_input('Timeout (s)', value=st.session_state.cfg.get('timeout',10), min_value=1, max_value=120, key='cfg_timeout')
-            st.session_state.cfg['retries'] = col_b.number_input('Retries', value=st.session_state.cfg.get('retries',3), min_value=0, max_value=10, key='cfg_retries')
-            st.session_state.cfg['backoff_factor'] = col_c.number_input('Backoff factor', value=st.session_state.cfg.get('backoff_factor',0.3), min_value=0.0, max_value=10.0, key='cfg_backoff')
+            st.session_state.cfg['timeout'] = col_a.number_input('Timeout (s)', value=st.session_state.cfg.get('timeout', 10), min_value=1, max_value=120, key='cfg_timeout')
+            st.session_state.cfg['retries'] = col_b.number_input('Retries', value=st.session_state.cfg.get('retries', 3), min_value=0, max_value=10, key='cfg_retries')
+            st.session_state.cfg['backoff_factor'] = col_c.number_input('Backoff factor', value=st.session_state.cfg.get('backoff_factor', 0.3), min_value=0.0, max_value=10.0, key='cfg_backoff')
 
             st.markdown('**Modelos**')
-            st.session_state.cfg['recognition_model'] = st.selectbox('Recognition model', ["recognition_04","recognition_03","recognition_02","recognition_01"], index=0, key='cfg_recog_model')
-            st.session_state.cfg['detection_model'] = st.selectbox('Detection model', ["detection_03","detection_02","detection_01"], index=0, key='cfg_det_model')
+            st.session_state.cfg['recognition_model'] = st.selectbox('Recognition model', ["recognition_04", "recognition_03", "recognition_02", "recognition_01"], index=0, key='cfg_recog_model')
+            st.session_state.cfg['detection_model'] = st.selectbox('Detection model', ["detection_03", "detection_02", "detection_01"], index=0, key='cfg_det_model')
 
             # enable identification features flag
-            st.session_state.cfg['enable_identification_features'] = st.checkbox('Habilitar IDENTIFICACIÓN/VERIFICACIÓN/persongroups (solo si Microsoft te aprobó)', value=st.session_state.cfg.get('enable_identification_features', False), key='cfg_enable_id')
+            st.session_state.cfg['enable_identification_features'] = st.checkbox('Habilitar IDENTIFICACIÓN/VERIFICACIÓN/persongroups (solo si Microsoft te aprobó)',
+                                                                                 value=st.session_state.cfg.get('enable_identification_features', False), key='cfg_enable_id')
 
             if st.button('Guardar configuración en sesión', key='cfg_save_btn'):
                 st.success('Configuración guardada en sesión (no persistente).')
@@ -555,26 +532,26 @@ def run_streamlit():
         with col2:
             st.subheader('Import / Export')
             st.markdown('Cargar desde archivo .env (KEY/ENDPOINT) o config.json con las mismas keys.')
-            uploaded = st.file_uploader('Subir .env o config.json', type=['env','txt','json'], key='cfg_upload')
+            uploaded = st.file_uploader('Subir .env o config.json', type=['env', 'txt', 'json'], key='cfg_upload')
             if uploaded and st.button('Cargar archivo', key='cfg_load_file'):
                 data = uploaded.read()
                 try:
                     if uploaded.name.endswith('.json'):
                         parsed = json.loads(data.decode('utf-8'))
                     else:
-                        # simple parse .env
                         parsed = {}
                         for line in data.decode('utf-8').splitlines():
                             if '=' in line and not line.strip().startswith('#'):
-                                k, v = line.split('=',1)
+                                k, v = line.split('=', 1)
                                 parsed[k.strip()] = v.strip().strip('"')
-                    # map keys
                     if 'FACE_ENDPOINT' in parsed:
                         st.session_state.cfg['endpoint'] = parsed.get('FACE_ENDPOINT')
                     if 'FACE_KEY' in parsed:
                         st.session_state.cfg['key'] = parsed.get('FACE_KEY')
                     if 'AUTH_METHOD' in parsed:
                         st.session_state.cfg['auth_method'] = parsed.get('AUTH_METHOD')
+                    if 'AZURE_STORAGE_CONNECTION_STRING' in parsed:
+                        st.session_state.cfg['blob_connection_string'] = parsed.get('AZURE_STORAGE_CONNECTION_STRING')
                     st.success('Configuración cargada al estado de sesión (revisa y guarda).')
                     log('Configuración cargada desde archivo')
                 except Exception as e:
@@ -597,11 +574,10 @@ def run_streamlit():
     # ---------- Detect Tab ----------
     with tabs[1]:
         st.header('Detectar rostros')
-        uploaded = st.file_uploader('Sube imagen para detectar', type=['jpg','jpeg','png'], key='detect_upload')
+        uploaded = st.file_uploader('Sube imagen para detectar', type=['jpg', 'jpeg', 'png'], key='detect_upload')
         detect_landmarks = st.checkbox('Devolver landmarks', value=False, key='detect_landmarks')
-        recognition_model = st.selectbox('Recognition model (detect)', ["recognition_04","recognition_03","recognition_02","recognition_01"], index=0, key='detect_recog')
-        detection_model = st.selectbox('Detection model (detect)', ["detection_03","detection_02","detection_01"], index=0, key='detect_det')
-        # decide whether to request faceId based on config flag
+        recognition_model = st.selectbox('Recognition model (detect)', ["recognition_04", "recognition_03", "recognition_02", "recognition_01"], index=0, key='detect_recog')
+        detection_model = st.selectbox('Detection model (detect)', ["detection_03", "detection_02", "detection_01"], index=0, key='detect_det')
         allow_face_id = st.session_state.cfg.get('enable_identification_features', False)
         if allow_face_id:
             st.info('Has habilitado IDENTIFICACIÓN: la API intentará devolver faceId (solo si tu recurso está aprobado).')
@@ -611,7 +587,6 @@ def run_streamlit():
             img_bytes = uploaded.read()
             faces = try_core(detect_faces_core, img_bytes, return_landmarks=detect_landmarks, return_face_id=allow_face_id, recognition_model=recognition_model, detection_model=detection_model)
             if faces is not None:
-                # draw boxes
                 image = Image.open(BytesIO(img_bytes)).convert('RGB')
                 draw = ImageDraw.Draw(image)
                 try:
@@ -629,17 +604,17 @@ def run_streamlit():
                 st.image(image, use_column_width=True)
                 st.json(faces)
 
-    # ---------- Attributes Tab (nuevo) ----------
+    # ---------- Attributes Tab ----------
     with tabs[2]:
         st.header('Face Attributes — reconocimiento de características')
         st.markdown('Selecciona qué atributos quieres que Face API devuelva para la imagen subida. Algunos atributos requieren modelos/planes concretos.')
         attr_all = [
-            'age','gender','headPose','smile','facialHair','glasses','emotion',
-            'hair','makeup','occlusion','accessories','blur','exposure','noise'
+            'age', 'gender', 'headPose', 'smile', 'facialHair', 'glasses', 'emotion',
+            'hair', 'makeup', 'occlusion', 'accessories', 'blur', 'exposure', 'noise'
         ]
         st.markdown('**Atributos disponibles**: ' + ', '.join(attr_all))
-        uploaded_attr = st.file_uploader('Sube imagen para analizar atributos', type=['jpg','jpeg','png'], key='attr_upload')
-        default_checked = ['age','gender','emotion','hair','glasses']
+        uploaded_attr = st.file_uploader('Sube imagen para analizar atributos', type=['jpg', 'jpeg', 'png'], key='attr_upload')
+        default_checked = ['age', 'gender', 'emotion', 'hair', 'glasses']
         cols = st.columns(3)
         selected_attrs = []
         for i, a in enumerate(attr_all):
@@ -648,74 +623,50 @@ def run_streamlit():
                 selected_attrs.append(a)
         if uploaded_attr and st.button('Analizar atributos', key='attr_analyze'):
             img = uploaded_attr.read()
-            # build attributes param
             attrs_param = ','.join(selected_attrs) if selected_attrs else None
-            faces = try_core(detect_faces_core, img, return_landmarks=True, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'), return_face_attributes=attrs_param)
+            faces = try_core(detect_faces_core, img, return_landmarks=True, return_face_id=allow_face_id,
+                             recognition_model=st.session_state.cfg.get('recognition_model'),
+                             detection_model=st.session_state.cfg.get('detection_model'),
+                             return_face_attributes=attrs_param)
             if not faces:
                 st.warning('No se detectaron caras')
             else:
-                # build a readable table of attributes
                 rows = []
                 for idx, f in enumerate(faces):
                     face_attr = f.get('faceAttributes', {})
                     row = {'faceIndex': idx, 'faceId': f.get('faceId')}
-                    # basic attributes
                     row['age'] = face_attr.get('age')
                     row['gender'] = face_attr.get('gender')
                     row['smile'] = face_attr.get('smile')
-                    # headPose
                     hp = face_attr.get('headPose')
                     if hp:
-                        row['headPose_roll'] = hp.get('roll')
-                        row['headPose_yaw'] = hp.get('yaw')
-                        row['headPose_pitch'] = hp.get('pitch')
-                    # facialHair
-                    fh = face_attr.get('facialHair')
-                    if fh:
-                        row['facialHair_moustache'] = fh.get('moustache')
-                        row['facialHair_beard'] = fh.get('beard')
-                        row['facialHair_sideburns'] = fh.get('sideburns')
-                    # glasses
+                        row['headPose_roll'] = hp.get('roll'); row['headPose_yaw'] = hp.get('yaw'); row['headPose_pitch'] = hp.get('pitch')
+                    fh = face_attr.get('facialHair') or {}
+                    row['facialHair_moustache'] = fh.get('moustache'); row['facialHair_beard'] = fh.get('beard'); row['facialHair_sideburns'] = fh.get('sideburns')
                     row['glasses'] = face_attr.get('glasses')
-                    # emotion: dominant
                     emo = face_attr.get('emotion') or {}
                     if emo:
                         dominant = max(emo.items(), key=lambda x: x[1]) if emo.items() else (None, None)
                         row['emotion_dominant'] = dominant[0]
                         row.update({f'emotion_{k}': v for k, v in emo.items()})
-                    # hair
                     hair = face_attr.get('hair') or {}
                     row['hair_bald'] = hair.get('bald')
                     hair_colors = hair.get('hairColor') or []
                     if hair_colors:
-                        # pick highest confidence
-                        hc = sorted(hair_colors, key=lambda x: x.get('confidence',0), reverse=True)[0]
-                        row['hair_color'] = hc.get('color')
-                        row['hair_color_confidence'] = hc.get('confidence')
-                    # makeup
+                        hc = sorted(hair_colors, key=lambda x: x.get('confidence', 0), reverse=True)[0]
+                        row['hair_color'] = hc.get('color'); row['hair_color_confidence'] = hc.get('confidence')
                     makeup = face_attr.get('makeup') or {}
-                    row['makeup_eyeMakeup'] = makeup.get('eyeMakeup')
-                    row['makeup_lipMakeup'] = makeup.get('lipMakeup')
-                    # occlusion
+                    row['makeup_eyeMakeup'] = makeup.get('eyeMakeup'); row['makeup_lipMakeup'] = makeup.get('lipMakeup')
                     occ = face_attr.get('occlusion') or {}
-                    row['occlusion_forehead'] = occ.get('foreheadOccluded')
-                    row['occlusion_eyeLeft'] = occ.get('eyeLeftOccluded')
-                    row['occlusion_eyeRight'] = occ.get('eyeRightOccluded')
-                    # accessories
+                    row['occlusion_forehead'] = occ.get('foreheadOccluded'); row['occlusion_eyeLeft'] = occ.get('eyeLeftOccluded'); row['occlusion_eyeRight'] = occ.get('eyeRightOccluded')
                     accessories = face_attr.get('accessories') or []
                     row['accessories'] = ','.join([a.get('type') for a in accessories]) if accessories else None
-                    # image quality
-                    blur = face_attr.get('blur') or {}
-                    row['blur_blurLevel'] = blur.get('blurLevel')
-                    exposure = face_attr.get('exposure') or {}
-                    row['exposure_exposureLevel'] = exposure.get('exposureLevel')
-                    noise = face_attr.get('noise') or {}
-                    row['noise_noiseLevel'] = noise.get('noiseLevel')
-
+                    blur = face_attr.get('blur') or {}; row['blur_blurLevel'] = blur.get('blurLevel')
+                    exposure = face_attr.get('exposure') or {}; row['exposure_exposureLevel'] = exposure.get('exposureLevel')
+                    noise = face_attr.get('noise') or {}; row['noise_noiseLevel'] = noise.get('noiseLevel')
                     rows.append(row)
                 df = pd.DataFrame(rows)
                 st.table(df)
-                # also show full json per face
                 for i, f in enumerate(faces):
                     st.subheader(f'Face #{i} JSON')
                     st.json(f)
@@ -724,13 +675,17 @@ def run_streamlit():
     with tabs[3]:
         st.header('Verificar (one-to-one)')
         col_a, col_b = st.columns(2)
-        img1 = col_a.file_uploader('Imagen A', key='v_img1', type=['jpg','jpeg','png'])
-        img2 = col_b.file_uploader('Imagen B', key='v_img2', type=['jpg','jpeg','png'])
+        img1 = col_a.file_uploader('Imagen A', key='v_img1', type=['jpg', 'jpeg', 'png'])
+        img2 = col_b.file_uploader('Imagen B', key='v_img2', type=['jpg', 'jpeg', 'png'])
         if img1 and img2:
             b1 = img1.read(); b2 = img2.read()
-            f1 = try_core(detect_faces_core, b1, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
-            f2 = try_core(detect_faces_core, b2, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
-            if f1 and f2 and len(f1)>0 and len(f2)>0:
+            f1 = try_core(detect_faces_core, b1, return_landmarks=False, return_face_id=allow_face_id,
+                          recognition_model=st.session_state.cfg.get('recognition_model'),
+                          detection_model=st.session_state.cfg.get('detection_model'))
+            f2 = try_core(detect_faces_core, b2, return_landmarks=False, return_face_id=allow_face_id,
+                          recognition_model=st.session_state.cfg.get('recognition_model'),
+                          detection_model=st.session_state.cfg.get('detection_model'))
+            if f1 and f2 and len(f1) > 0 and len(f2) > 0:
                 if not f1[0].get('faceId') or not f2[0].get('faceId'):
                     st.error('No se devolvió faceId en la detección. Activa IDENTIFICACIÓN en Config si tu recurso está aprobado por Microsoft.')
                 else:
@@ -744,7 +699,7 @@ def run_streamlit():
     # ---------- Identify Tab ----------
     with tabs[4]:
         st.header('Identificar (one-to-many)')
-        id_img = st.file_uploader('Imagen para identificar', type=['jpg','jpeg','png'], key='identify_img')
+        id_img = st.file_uploader('Imagen para identificar', type=['jpg', 'jpeg', 'png'], key='identify_img')
         groups = try_core(list_large_person_groups_core) or []
         group_options = {g['largePersonGroupId']: g.get('name') for g in groups} if groups else {}
         selected_group = st.selectbox('LargePersonGroup', options=[''] + list(group_options.keys()), key='identify_group')
@@ -752,9 +707,10 @@ def run_streamlit():
         conf_thr = st.slider('Confidence threshold', 0.0, 1.0, 0.5, key='identify_conf')
         if id_img and selected_group:
             b = id_img.read()
-            faces = try_core(detect_faces_core, b, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
+            faces = try_core(detect_faces_core, b, return_landmarks=False, return_face_id=allow_face_id,
+                             recognition_model=st.session_state.cfg.get('recognition_model'),
+                             detection_model=st.session_state.cfg.get('detection_model'))
             if faces:
-                # ensure faceIds exist
                 faceIds = [f.get('faceId') for f in faces if f.get('faceId')]
                 if not faceIds:
                     st.error('No se devolvieron faceId. Activa IDENTIFICACIÓN en Config si tu recurso está aprobado.')
@@ -776,12 +732,14 @@ def run_streamlit():
     # ---------- FindSimilar Tab ----------
     with tabs[5]:
         st.header('Find Similar')
-        f_img = st.file_uploader('Imagen de consulta', type=['jpg','jpeg','png'], key='fs_img')
+        f_img = st.file_uploader('Imagen de consulta', type=['jpg', 'jpeg', 'png'], key='fs_img')
         large_face_list = st.text_input('LargeFaceListId (si aplica)', key='fs_lfl')
         maxcand = st.slider('Max candidatos', 1, 10, 5, key='fs_maxc')
         if f_img:
             b = f_img.read()
-            faces = try_core(detect_faces_core, b, return_landmarks=False, return_face_id=allow_face_id, recognition_model=st.session_state.cfg.get('recognition_model'), detection_model=st.session_state.cfg.get('detection_model'))
+            faces = try_core(detect_faces_core, b, return_landmarks=False, return_face_id=allow_face_id,
+                             recognition_model=st.session_state.cfg.get('recognition_model'),
+                             detection_model=st.session_state.cfg.get('detection_model'))
             if faces:
                 fid = faces[0].get('faceId')
                 if not fid:
@@ -791,7 +749,7 @@ def run_streamlit():
                     if res:
                         st.json(res)
 
-    # ---------- Collections Tab (incluye A: persona detalle) ----------
+    # ---------- Collections Tab ----------
     with tabs[6]:
         st.header('Collections / LargePersonGroup')
         st.subheader('Crear LargePersonGroup')
@@ -867,7 +825,7 @@ def run_streamlit():
                 persisted = person_detail.get('persistedFaceIds', [])
                 st.write('persistedFaceIds:')
                 for pf in persisted:
-                    cols = st.columns([6,1,1])
+                    cols = st.columns([6, 1, 1])
                     cols[0].write(pf)
                     if cols[1].button('Borrar persistedFace', key=f'del_pf_{pf}'):
                         try:
@@ -924,10 +882,11 @@ def run_streamlit():
     # ---------- Liveness Tab ----------
     with tabs[8]:
         st.header('Liveness (sesiones)')
-        st.markdown("""Esta sección crea una sesión de liveness (server side) y permite consultar resultados. La parte de cliente (subir vídeo/selfie desde dispositivo para la sesión) debe integrarse en tu frontend usando el token/URL de la sesión.
+        st.markdown("""Esta sección crea una sesión de liveness (server side) y permite consultar resultados.
+La parte de cliente (subir vídeo/selfie desde dispositivo para la sesión) debe integrarse en tu frontend usando el token/URL de la sesión.
 
-    **Importante**: el servicio Liveness puede requerir acceso por separado y está sujeto a políticas de uso de Face. """)
-        l_mode = st.selectbox('Modo', ['active','passive'], key='liveness_mode')
+**Importante**: el servicio Liveness puede requerir acceso por separado y está sujeto a políticas de uso de Face.""")
+        l_mode = st.selectbox('Modo', ['active', 'passive'], key='liveness_mode')
         verify_img = st.file_uploader('Opcional: imagen para verificar durante la sesión (verify image)', key='liveness_verify')
         if st.button('Crear sesión de liveness', key='liveness_create'):
             v = verify_img.read() if verify_img else None
@@ -945,12 +904,13 @@ def run_streamlit():
         st.header('Storage: Azure Blob & Data Lake')
         st.markdown('Configura y prueba uploads/downloads a Blob Storage y ADLS Gen2.')
         st.subheader('Storage settings (optional)')
-        st.text_input('Blob connection string', value=st.session_state.cfg.get('blob_connection_string',''), key='cfg_blob_conn')
-        st.text_input('Blob account URL (https://<account>.blob.core.windows.net)', value=st.session_state.cfg.get('blob_account_url',''), key='cfg_blob_url')
-        st.text_input('DataLake account URL (https://<account>.dfs.core.windows.net)', value=st.session_state.cfg.get('datalake_account_url',''), key='cfg_datalake_url')
-        st.session_state.cfg['blob_connection_string'] = st.session_state.get('cfg_blob_conn', st.session_state.cfg.get('blob_connection_string',''))
-        st.session_state.cfg['blob_account_url'] = st.session_state.get('cfg_blob_url', st.session_state.cfg.get('blob_account_url',''))
-        st.session_state.cfg['datalake_account_url'] = st.session_state.get('cfg_datalake_url', st.session_state.cfg.get('datalake_account_url',''))
+        st.text_input('Blob connection string', value=st.session_state.cfg.get('blob_connection_string', ''), key='cfg_blob_conn')
+        st.text_input('Blob account URL (https://<account>.blob.core.windows.net)', value=st.session_state.cfg.get('blob_account_url', ''), key='cfg_blob_url')
+        st.text_input('DataLake account URL (https://<account>.dfs.core.windows.net)', value=st.session_state.cfg.get('datalake_account_url', ''), key='cfg_datalake_url')
+        # persist into cfg
+        st.session_state.cfg['blob_connection_string'] = st.session_state.get('cfg_blob_conn', st.session_state.cfg.get('blob_connection_string', ''))
+        st.session_state.cfg['blob_account_url'] = st.session_state.get('cfg_blob_url', st.session_state.cfg.get('blob_account_url', ''))
+        st.session_state.cfg['datalake_account_url'] = st.session_state.get('cfg_datalake_url', st.session_state.cfg.get('datalake_account_url', ''))
         col1, col2 = st.columns(2)
         with col1:
             st.subheader('Blob Storage')
@@ -998,6 +958,6 @@ def run_streamlit():
     st.markdown('---')
     st.caption('Recuerda: el uso de tecnologías biométricas tiene implicaciones legales y de privacidad. Usa solo con consentimiento y según la normativa aplicable.')
 
-# Run streamlit UI only when executed as script (so uvicorn can import module without launching UI)
+# Run streamlit UI only when executed as script
 if __name__ == '__main__':
     run_streamlit()
